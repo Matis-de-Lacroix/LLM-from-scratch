@@ -1,18 +1,16 @@
 """
-minigpt_dumas.py — a character-level GPT trained from scratch on Dumas.
+A small character-level GPT, written from scratch and trained on Dumas'
+"Les Trois Mousquetaires".
 
-A compact, decoder-only transformer (GPT-2 style) implemented by hand in PyTorch
-and trained on Alexandre Dumas' "Les Trois Mousquetaires". Every component — the
-character tokenizer, multi-head causal self-attention, the training loop and the
-autoregressive sampler — is written explicitly rather than pulled from a library,
-so the whole pipeline that produced the results fits in one readable file.
+Decoder-only transformer, GPT-2 style. Nothing here comes from a modelling
+library: the tokenizer, causal attention, training loop and sampler are all
+spelled out. ~830k parameters, small enough to train on a laptop.
 
-Run:
     pip install torch
     python minigpt_dumas.py
 
-Trains in ~10-20 min on CPU (much faster on a GPU), then prints generated text at
-three sampling temperatures.
+Roughly 15 min on CPU, a couple of minutes on a GPU. Prints samples at three
+temperatures once it's done.
 """
 import os
 import urllib.request
@@ -21,33 +19,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------------------------------------------------------------------------- #
-# Hyperparameters
-# --------------------------------------------------------------------------- #
-BATCH_SIZE = 32          # sequences per training step
-BLOCK_SIZE = 64          # context length (max tokens the model attends to)
-N_EMBD     = 128         # embedding / residual stream width
-N_HEAD     = 4           # attention heads (N_EMBD must be divisible by N_HEAD)
-N_LAYER    = 4           # stacked transformer blocks
+# --- hyperparameters ---------------------------------------------------------
+BATCH_SIZE = 32
+BLOCK_SIZE = 64          # context window, and therefore the size of pos_emb
+N_EMBD     = 128
+N_HEAD     = 4           # has to divide N_EMBD
+N_LAYER    = 4
 DROPOUT    = 0.1
 MAX_STEPS  = 3000
 LEARNING_RATE = 3e-4
-EVAL_INTERVAL = 300      # steps between train/val loss estimates
-EVAL_BATCHES  = 50       # batches averaged per loss estimate
+EVAL_INTERVAL = 300
+EVAL_BATCHES  = 50       # one batch is far too noisy to judge progress on
 SEED = 42
 
 CORPUS_URL = "https://www.gutenberg.org/ebooks/13951.txt.utf-8"  # Les Trois Mousquetaires
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# --------------------------------------------------------------------------- #
-# 1. Corpus + character-level tokenizer
-# --------------------------------------------------------------------------- #
+# --- corpus and tokenizer ----------------------------------------------------
 def load_corpus(path="corpus.txt"):
-    """Download the novel once and strip the Project Gutenberg header/footer."""
+    """Fetch the novel once, then cut off the Gutenberg header and licence."""
     if not os.path.exists(path):
         urllib.request.urlretrieve(CORPUS_URL, path)
     text = open(path, encoding="utf-8").read()
+    # the banner reads "*** START OF ... ***", so jump to its closing *** —
+    # stopping at the first one leaves the banner text in the corpus
     start = text.find("***", text.find("*** START") + 3) + 3
     end = text.find("*** END")
     return text[start:end]
@@ -55,8 +51,8 @@ def load_corpus(path="corpus.txt"):
 
 text = load_corpus()
 
-# The tokenizer is deliberately trivial: one token = one character. This keeps
-# the vocabulary tiny so that all the modelling effort goes into the transformer.
+# one token = one character. Crude next to BPE, but it keeps the vocab around a
+# hundred entries and puts all the difficulty where it's interesting.
 chars = sorted(set(text))
 VOCAB_SIZE = len(chars)
 stoi = {c: i for i, c in enumerate(chars)}
@@ -64,18 +60,17 @@ itos = {i: c for i, c in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda ids: "".join(itos[i] for i in ids)
 
-# Encode the whole corpus and split 90/10 into train / validation.
+# 90/10 split, validation held out from the end of the book
 data = torch.tensor(encode(text), dtype=torch.long)
 n = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
 
 
 def get_batch(split):
-    """Sample a batch of (context, target) pairs.
+    """Random (context, target) pairs, both (B, T).
 
-    `y` is `x` shifted by one position: at every time step the target is the
-    next character. This is the whole supervised signal behind "predict the
-    next token".
+    y is x shifted one character to the right — that shift is the whole
+    supervision signal behind "predict the next token".
     """
     d = train_data if split == "train" else val_data
     ix = torch.randint(len(d) - BLOCK_SIZE - 1, (BATCH_SIZE,))
@@ -84,20 +79,17 @@ def get_batch(split):
     return x.to(device), y.to(device)
 
 
-# --------------------------------------------------------------------------- #
-# 2. The model
-# --------------------------------------------------------------------------- #
+# --- model -------------------------------------------------------------------
 class Block(nn.Module):
-    """One transformer block: causal self-attention, then a feed-forward MLP.
+    """Causal self-attention, then an MLP, pre-norm and residual on both.
 
-    Both sub-layers use pre-normalisation (LayerNorm first) and a residual
-    connection, exactly as in GPT-2. The residual paths are what let many blocks
-    be stacked and still train.
+    Same layout as GPT-2. The residual path is the load-bearing part: strip it
+    out and a stack this deep stops training properly.
     """
 
     def __init__(self):
         super().__init__()
-        # Query, key and value projections are fused into a single Linear.
+        # q, k and v in one matmul instead of three — same maths, less overhead
         self.qkv = nn.Linear(N_EMBD, 3 * N_EMBD, bias=False)
         self.proj = nn.Linear(N_EMBD, N_EMBD)
         self.ffwd = nn.Sequential(
@@ -106,25 +98,27 @@ class Block(nn.Module):
         )
         self.ln1, self.ln2 = nn.LayerNorm(N_EMBD), nn.LayerNorm(N_EMBD)
         self.drop = nn.Dropout(DROPOUT)
-        # Causal mask: position t may only attend to positions <= t.
+        # lower triangle: token t may only look at 0..t, never at the future
         self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
 
     def attention(self, x):
         B, T, C = x.shape
         hs = C // N_HEAD
         q, k, v = self.qkv(x).split(C, dim=2)
-        q = q.view(B, T, N_HEAD, hs).transpose(1, 2)
+        q = q.view(B, T, N_HEAD, hs).transpose(1, 2)           # (B, nh, T, hs)
         k = k.view(B, T, N_HEAD, hs).transpose(1, 2)
         v = v.view(B, T, N_HEAD, hs).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * hs ** -0.5           # scaled scores
+        # the 1/sqrt(hs) matters: without it the dot products grow with head
+        # size and softmax saturates into something close to one-hot
+        att = (q @ k.transpose(-2, -1)) * hs ** -0.5           # (B, nh, T, T)
         att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         att = self.drop(F.softmax(att, dim=-1))
-        out = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        out = (att @ v).transpose(1, 2).contiguous().view(B, T, C)   # heads back together
         return self.proj(out)
 
     def forward(self, x):
-        x = x + self.attention(self.ln1(x))   # communication: tokens exchange info
-        x = x + self.ffwd(self.ln2(x))        # computation: each token thinks alone
+        x = x + self.attention(self.ln1(x))   # tokens look at each other
+        x = x + self.ffwd(self.ln2(x))        # then each one digests on its own
         return x
 
 
@@ -150,15 +144,17 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """Autoregressive sampling.
+        """Sample one character at a time, feeding each one back in.
 
-        temperature < 1 makes the model safer / more repetitive, > 1 more
-        creative; top_k restricts sampling to the k most likely characters.
+        temperature < 1 sharpens the distribution (safe, repetitive), > 1
+        flattens it (wilder). top_k throws away everything outside the k best
+        candidates, which is what stops the odd absurd character slipping in.
         """
         self.eval()
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -BLOCK_SIZE:])       # crop to context window
-            logits = logits[:, -1, :] / temperature      # last step only
+            # pos_emb only knows BLOCK_SIZE positions, so keep the last ones
+            logits, _ = self(idx[:, -BLOCK_SIZE:])
+            logits = logits[:, -1, :] / temperature      # only the next step matters
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
                 logits[logits < v[:, [-1]]] = float("-inf")
@@ -168,13 +164,14 @@ class GPT(nn.Module):
         return idx
 
 
-# --------------------------------------------------------------------------- #
-# 3. Training
-# --------------------------------------------------------------------------- #
+# --- training ----------------------------------------------------------------
 @torch.no_grad()
 def estimate_loss(model):
-    """Average the loss over several batches of train and val — the gap between
-    the two is our overfitting detector."""
+    """Loss averaged over a few batches of each split.
+
+    A single batch bounces around far too much to tell whether anything is
+    improving. The gap between the two numbers is the overfitting signal.
+    """
     model.eval()
     out = {}
     for split in ("train", "val"):
@@ -206,9 +203,7 @@ def train():
     return model
 
 
-# --------------------------------------------------------------------------- #
-# 4. Run: train, then compare sampling temperatures
-# --------------------------------------------------------------------------- #
+# --- train, then listen to the thing at three temperatures -------------------
 if __name__ == "__main__":
     model = train()
 
