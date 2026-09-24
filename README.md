@@ -55,7 +55,7 @@ So with under a million parameters and no notion of words (it works one letter a
 
 I ran a controlled test: same model, same data, same 1500 training steps, changing only the context length (`BLOCK_SIZE`) from 64 to 128.
 
-![Effect of context length](assets/comparison.png)
+![Effect of context length](assets/comparaison.png)
 
 | | Context 64 | Context 128 |
 |---|---|---|
