@@ -51,6 +51,23 @@ Turn the temperature up to 1.5 and it gets more creative but loses the thread, t
 
 So with under a million parameters and no notion of words (it works one letter at a time), it already picks up Dumas' vocabulary, character names and the look of his dialogue, just not full grammar. That's kind of the whole lesson: the architecture is the same one behind the models that *do* write fluently, and the rest is mostly scale (more parameters, more data, more compute).
 
+## A small experiment: does a longer context help?
+
+I ran a controlled test: same model, same data, same 1500 training steps, changing only the context length (`BLOCK_SIZE`) from 64 to 128.
+
+![Effect of context length](assets/comparison.png)
+
+| | Context 64 | Context 128 |
+|---|---|---|
+| Parameters | 827,242 | 835,434 |
+| Final validation loss | **1.727** | 1.780 |
+
+Doubling the context brought no improvement: the two curves sit almost on top of each other, and 128 is even marginally worse, while being much slower to train (attention cost grows with the square of the context length). That is surprising at first, since more context should mean more information to predict from.
+
+The reason is capacity. At under a million parameters the model is *capacity-bound*, not *context-bound*: it is too small to model long-range dependencies, and at character level the signal it can actually use is mostly local. So the extra context is simply wasted.
+
+This is the most useful thing the project taught me, and it points straight at the next step: scale, not tuning. A model with around 100M parameters would have the capacity to turn a longer context and more data into real fluency, the grammar this one never reaches. That larger version is what I am building next.
+
 ## Try it
 
 ```bash
@@ -60,9 +77,9 @@ python minigpt_dumas.py
 
 It trains the model and prints samples at three temperatures. Point `CORPUS_URL` at any UTF-8 text file to train on something else.
 
-## What I'd do next
+## What's next
 
-It's a learning project, so it's deliberately small and character-level. The obvious next steps: a BPE tokenizer, a bigger model and longer context on a GPU (my CPU run took a full day), KV-caching for faster generation, and a modern positional scheme like RoPE.
+The headline next step is a ~100M-parameter version trained on GPU, to see the jump in fluency that scale is supposed to buy (and to finally make a longer context pay off). Along the way: a BPE tokenizer so the model works with subwords instead of single characters, KV-caching for faster generation, and modern positional encodings such as RoPE.
 
 ## Credits
 
